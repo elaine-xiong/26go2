@@ -1,5 +1,5 @@
 # -*- coding: gbk -*-
-# 重新加入摄像头预热
+# 集成版：机械臂联动
 # nohup python -u total10.py > robot_run.log 2>&1 &
 import cv2
 import cv2.aruco as aruco
@@ -9,6 +9,7 @@ import math
 import os
 import sys
 import threading
+import subprocess
 import pyrealsense2 as rs
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
@@ -28,6 +29,26 @@ STATE_DO_STAIRS          = 4
 STATE_FOLLOW_TO_RED_DOT  = 5
 STATE_RED_DOT_ACTION     = 6
 STATE_RETURN             = 7
+
+# ==========================================
+# 机械臂配置
+# ==========================================
+# 狗用相机序列号
+DOG_CAMERA_SERIAL = "135122071432"
+
+# 机械臂脚本路径（与本文件同目录）
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+ARM_SCRIPT_PATH = os.path.join(_THIS_DIR, "arm_one_shot.py")
+ARM_CAMERA_SERIAL = "115222070999"
+ARM_PORT = "/dev/ttyUSB0"
+ARM_TIMEOUT = 40.0           # 臂脚本整体超时
+
+# 位置二：横向平移参数
+POINT2_RIGHT_VY = 0.25        # 右移速度
+POINT2_RIGHT_DURATION = 1.5   # 右移时长（秒）
+
+# 位置三：STATE_RETURN 子阶段0 巡线时长
+RET_SUB_PHASE0_LINE_TIME = 4.0
 
 # ==========================================
 # 视觉/感知算法模块
@@ -143,21 +164,27 @@ class RobotFSM:
         self.HEADING_TOL = 15.0
         self.IMU_PRINT_INTERVAL = 0.5
         self.last_imu_print_time = 0.0
-        
-        # 回航参数
+
+        # 回航参数（do_return_tick 内部使用）
         self.return_phase = 0
         self.return_phase_start = 0.0
         self.return_target_rel_yaw = None
 
         self.RETURN_FORWARD_VX = 0.28
-        self.RETURN_FORWARD_TIME = 1.6   # 先前进多久，按现场调
-        self.RETURN_HEADING_TOL = 8.0    # 回到目标朝向的容差
+        self.RETURN_FORWARD_TIME = 1.6
+        self.RETURN_HEADING_TOL = 8.0
         self.RETURN_TURN_GAIN = 0.018
         self.RETURN_TURN_MAX = 0.60
         self.RETURN_TURN_MIN = 0.22
 
+        # STATE_RETURN 子阶段（新增）
+        # ret_sub_phase = 0: 计时巡线 → 停住 → 机械臂
+        # ret_sub_phase = 1: 泡沫条检测 + 方位回航（原逻辑）
+        self.ret_sub_phase = 0
+        self.ret_sub_phase_start = 0.0
+
         # state 5 内部子阶段
-        self.red_dot_phase = 0   # 0: 第一点前；1: 第二点前；2: 红点识别段
+        self.red_dot_phase = 0
         self.point1_done = False
         self.point2_done = False
         self.point1_object_label = None
@@ -283,6 +310,57 @@ class RobotFSM:
         self.safe_move(0, 0, 0, force=True)
         time.sleep(5.0)
 
+    # ==========================================
+    # 机械臂子进程调用（新增）
+    # ==========================================
+    def _call_arm(self, position_label, timeout=None, task="grab",
+                  direction="left", grip_close=700):
+        """
+        启动 arm_one_shot.py 子进程，等待完成或超时。
+        返回 True=成功, False=失败/超时/异常
+        无论成败，狗继续流程，不死等。
+        """
+        if timeout is None:
+            timeout = ARM_TIMEOUT
+
+        cmd = [
+            sys.executable,
+            ARM_SCRIPT_PATH,
+            "--serial", ARM_CAMERA_SERIAL,
+            "--port", ARM_PORT,
+            "--timeout", str(int(timeout)),
+            "--task", task,
+            "--direction", direction,
+            "--grip-close", str(grip_close),
+            "--label", position_label,
+        ]
+        print(f"[ARM] 启动: {' '.join(cmd)}")
+
+        try:
+            proc = subprocess.Popen(cmd)
+            # 等待时间 = 臂内部超时 + 5 秒余量
+            proc.wait(timeout=timeout + 5)
+            if proc.returncode == 0:
+                print(f"[ARM] {position_label} — 成功")
+                return True
+            else:
+                print(f"[ARM] {position_label} — 失败 (exitcode={proc.returncode})")
+                return False
+        except subprocess.TimeoutExpired:
+            print(f"[ARM] {position_label} — 超时 ({timeout+5}s)，强制终止")
+            proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            return False
+        except FileNotFoundError:
+            print(f"[ARM] {position_label} — 错误：找不到脚本 {ARM_SCRIPT_PATH}")
+            return False
+        except Exception as e:
+            print(f"[ARM] {position_label} — 异常: {e}")
+            return False
+
     def _recognize_template_label(self, timeout=10.0):
         """
         复用模板识别逻辑，返回 best_label，识别不到返回 None
@@ -350,7 +428,7 @@ class RobotFSM:
 
     def execute_point1_vision_task(self):
         """
-        第一个IMU点触发后的图像识别任务。
+        第一个IMU点触发后的图像识别 + 机械臂操作。
         """
         print(">>> 第一个点：开始图像识别，确定物块放置位置 <<<")
         label = self._recognize_template_label(timeout=10.0)
@@ -358,13 +436,20 @@ class RobotFSM:
 
         if label is None:
             print("[Point1] 没识别到有效目标")
-            return
+        else:
+            print(f"[Point1] 识别结果 label = {label}")
+            # TODO: 根据 label 做不同处理（如放置不同物块）
+            # if label == 0: ...
+            # elif label == 1: ...
+            # elif label == 2: ...
 
-        print(f"[Point1] 识别结果 label = {label}")
-        # TODO: 在这里接你的“物块放置动作”
-        # if label == 0: ...
-        # elif label == 1: ...
-        # elif label == 2: ...
+        # ===== 新增：调用机械臂抓取 =====
+        print(">>> 第一个点：启动机械臂抓取 <<<")
+        success = self._call_arm("point1", task="grab", direction="left")
+        if success:
+            print("[Point1] 机械臂抓取成功")
+        else:
+            print("[Point1] 机械臂抓取失败/超时，继续流程")
 
     def init_hardware(self):
         ChannelFactoryInitialize(0, self.iface)
@@ -389,8 +474,10 @@ class RobotFSM:
         time.sleep(2)
         self.sport.SpeedLevel(1)
 
+        # 使用狗专用相机序列号，避免和机械臂抢设备
         self.pipeline = rs.pipeline()
         config = rs.config()
+        config.enable_device(DOG_CAMERA_SERIAL)
         config.enable_stream(rs.stream.color, 424, 240, rs.format.bgr8, 30)
         self.pipeline.start(config)
 
@@ -424,6 +511,10 @@ class RobotFSM:
             self.point1_object_label = None
             self.point2_west_entry_count = 0
             self.point2_prev_west = False
+        # ===== 新增：STATE_RETURN 子阶段重置 =====
+        if new_state == STATE_RETURN:
+            self.ret_sub_phase = 0
+            self.ret_sub_phase_start = 0.0
 
     def move_continuous(self, vx, vy, vyaw, duration):
         t0 = time.time()
@@ -624,13 +715,6 @@ class RobotFSM:
 
         self.move_continuous(0, 0, -0.8, 2.5)  # 回归
 
-    # def execute_return_home_and_stop(self):
-    #     print(">>> 执行固定回航动作：前进2秒 -> 左转 -> 停止程序 <<<")
-    #     self.move_continuous(0.35, 0.0, 0.0, 3.0)
-    #     self.move_continuous(0.0, 0.0, 0.8, 3.0)
-    #     self.safe_move(0, 0, 0, force=True)
-    #     self.running = False
-    
     def _start_return_sequence(self, forward_time=1.6):
         """
         进入回航时调用：
@@ -640,7 +724,7 @@ class RobotFSM:
         """
         self.return_phase = 0
         self.return_phase_start = time.time()
-        self.return_target_rel_yaw = 0.0   # 回到起始姿态，而不是当前姿态
+        self.return_target_rel_yaw = 0.0
         self.RETURN_FORWARD_TIME = forward_time
         print(f"[RETURN] target heading = {self.return_target_rel_yaw:.2f} deg (startup pose)")
 
@@ -748,19 +832,41 @@ class RobotFSM:
                     elif self.red_dot_phase == 1:
                         self.do_line_follow_post_stair(frame)
 
-                        west_now = self._yaw_near(100.0)  # 你现在已经确认西是 +90
-                        # 统计“进入西向区间”的次数，而不是一直站在西向区间里反复触发
+                        west_now = self._yaw_near(100.0)
                         if west_now and (not self.point2_prev_west):
                             self.point2_west_entry_count += 1
                             print(f"[Point2] west entry count = {self.point2_west_entry_count}")
 
                         self.point2_prev_west = west_now
 
-                        # 第二次回到西时触发点二
+                        # ==============================================
+                        # 位置二：第二次回到西 → 右移 → 机械臂 → 左移
+                        # ==============================================
                         if self.imu_ready and (not self.point2_done) and self.point1_done and self.point2_west_entry_count >= 2:
                             self.point2_done = True
                             self.safe_move(0, 0, 0, force=True)
-                            self.pause_5s(">>> 第二次回到西，静止5秒 <<<")
+                            time.sleep(0.3)
+
+                            # ① 向右平移
+                            print(f">>> 第二个点：向右平移 {POINT2_RIGHT_DURATION}s <<<")
+                            self.move_continuous(0, POINT2_RIGHT_VY, 0, POINT2_RIGHT_DURATION)
+                            self.safe_move(0, 0, 0, force=True)
+                            time.sleep(0.3)
+
+                            # ② 机械臂抓取
+                            print(">>> 第二个点：启动机械臂抓取 <<<")
+                            success = self._call_arm("point2", task="place_grab", direction="right")
+                            if success:
+                                print("[Point2] 机械臂抓取成功")
+                            else:
+                                print("[Point2] 机械臂抓取失败/超时，继续流程")
+
+                            # ③ 向左平移归位
+                            print(f">>> 第二个点：向左平移归位 {POINT2_RIGHT_DURATION}s <<<")
+                            self.move_continuous(0, -POINT2_RIGHT_VY, 0, POINT2_RIGHT_DURATION)
+                            self.safe_move(0, 0, 0, force=True)
+                            time.sleep(0.3)
+
                             self.red_dot_phase = 2
                             continue
 
@@ -774,35 +880,56 @@ class RobotFSM:
                     self._execute_red_dot_sequence()
                     self.set_state(STATE_RETURN)
 
-                # elif self.state == STATE_RETURN:
-                #     if (not self.foam_triggered_state7) and time.time() >= self.foam_action_lock_until:
-                #         detected, foam_roi, foam_binary, foam_debug, max_break = detect_line_break(frame)
-                #         if detected:
-                #             print("Foam bar detected in STATE 7")
-                #             self.foam_triggered_state7 = True
-                #             self.foam_action_lock_until = time.time() + 3.0
-                #             self.execute_foam_jump_action(use_post_stair=True)
-                #             self.execute_return_home_and_stop()
-                #             continue
-                #     self.do_line_follow_post_stair(frame)
                 elif self.state == STATE_RETURN:
-                    if (not self.foam_triggered_state7) and time.time() >= self.foam_action_lock_until:
-                        detected, foam_roi, foam_binary, foam_debug, max_break = detect_line_break(frame)
-                        if detected:
-                            print("Foam bar detected in STATE 7")
-                            self.foam_triggered_state7 = True
-                            self.foam_action_lock_until = time.time() + 3.0
-                            self.execute_foam_jump_action(use_post_stair=True)
+                    # ==============================================
+                    # ret_sub_phase = 0: 计时巡线 → 停住 → 机械臂
+                    # ==============================================
+                    if self.ret_sub_phase == 0:
+                        if self.ret_sub_phase_start == 0.0:
+                            self.ret_sub_phase_start = now
+                            print(f"[RETURN] sub_phase=0: 巡线 {RET_SUB_PHASE0_LINE_TIME}s 后停住做机械臂")
 
-                            # 进入回航子流程：先记当前朝向，再前进，再转回
-                            self._start_return_sequence(forward_time=1.6)
-                            continue
+                        if now - self.ret_sub_phase_start < RET_SUB_PHASE0_LINE_TIME:
+                            self.do_line_follow_post_stair(frame)
+                        else:
+                            # 停住
+                            self.safe_move(0, 0, 0, force=True)
+                            time.sleep(0.3)
 
-                    # 回航阶段由 IMU 子状态机接管
-                    if self.foam_triggered_state7:
-                        self.do_return_tick()
-                    else:
-                        self.do_line_follow_post_stair(frame)
+                            # 调用机械臂
+                            print(">>> 位置三：启动机械臂操作 <<<")
+                            success = self._call_arm("point3", task="place", direction="left")
+                            if success:
+                                print("[Point3] 机械臂操作成功")
+                            else:
+                                print("[Point3] 机械臂操作失败/超时，继续流程")
+
+                            # 进入子阶段 1
+                            self.ret_sub_phase = 1
+                            self.ret_sub_phase_start = 0.0
+                        continue
+
+                    # ==============================================
+                    # ret_sub_phase = 1: 泡沫条检测 + 方位回航（原逻辑）
+                    # ==============================================
+                    if self.ret_sub_phase == 1:
+                        if (not self.foam_triggered_state7) and time.time() >= self.foam_action_lock_until:
+                            detected, foam_roi, foam_binary, foam_debug, max_break = detect_line_break(frame)
+                            if detected:
+                                print("Foam bar detected in STATE 7")
+                                self.foam_triggered_state7 = True
+                                self.foam_action_lock_until = time.time() + 3.0
+                                self.execute_foam_jump_action(use_post_stair=True)
+
+                                # 进入回航子流程：先记当前朝向，再前进，再转回
+                                self._start_return_sequence(forward_time=1.6)
+                                continue
+
+                        # 回航阶段由 IMU 子状态机接管
+                        if self.foam_triggered_state7:
+                            self.do_return_tick()
+                        else:
+                            self.do_line_follow_post_stair(frame)
 
                 time.sleep(0.05)
         finally:

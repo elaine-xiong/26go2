@@ -38,17 +38,21 @@ DOG_CAMERA_SERIAL = "135122071432"
 
 # 机械臂脚本路径（与本文件同目录）
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-ARM_SCRIPT_PATH = os.path.join(_THIS_DIR, "arm_one_shot.py")
+ARM_SCRIPT_PATH = os.path.join(_THIS_DIR, "arm.py")
 ARM_CAMERA_SERIAL = "115222070999"
 ARM_PORT = "/dev/ttyUSB0"
 ARM_TIMEOUT = 40.0           # 臂脚本整体超时
 
 # 位置二：横向平移参数
-POINT2_RIGHT_VY = 0.25        # 右移速度
+POINT2_RIGHT_VY = -0.3        # 右移速度
 POINT2_RIGHT_DURATION = 1.5   # 右移时长（秒）
 
 # 位置三：STATE_RETURN 子阶段0 巡线时长
 RET_SUB_PHASE0_LINE_TIME = 4.0
+
+# 夹爪力度（三棱锥=800，其余=700，抽签后只改对应的）
+POSITION1_GRIP_CLOSE = 700   # 位置① 夹取力度
+POSITION2_GRIP_CLOSE = 700   # 位置② 夹取力度
 
 # ==========================================
 # 视觉/感知算法模块
@@ -445,7 +449,8 @@ class RobotFSM:
 
         # ===== 新增：调用机械臂抓取 =====
         print(">>> 第一个点：启动机械臂抓取 <<<")
-        success = self._call_arm("point1", task="grab", direction="left")
+        success = self._call_arm("point1", task="grab", direction="left",
+                                grip_close=POSITION1_GRIP_CLOSE)
         if success:
             print("[Point1] 机械臂抓取成功")
         else:
@@ -855,7 +860,8 @@ class RobotFSM:
 
                             # ② 机械臂抓取
                             print(">>> 第二个点：启动机械臂抓取 <<<")
-                            success = self._call_arm("point2", task="place_grab", direction="right")
+                            success = self._call_arm("point2", task="place_grab", direction="right",
+                                                    grip_close=POSITION2_GRIP_CLOSE)
                             if success:
                                 print("[Point2] 机械臂抓取成功")
                             else:

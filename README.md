@@ -10,29 +10,19 @@
 | `Template_*.png` | 模板匹配图片（电/氧化剂/辐射） |
 
 ## 部署到 Go2
-
-```bash
-# 1. 把整个文件夹传到 Go2（U盘或 scp）
-scp -r integrated/ unitree@<go2_ip>:/home/unitree/workspace/xwh/
-
-# 2. SSH 到 Go2
-ssh unitree@<go2_ip>
-
-# 3. 安装依赖（只需要 pyserial wheel）
-cd /home/unitree/workspace/xwh/integrated
-python3 -m pip install pyserial-3.5-py2.py3-none-any.whl   # 如果没有就 pip install pyserial
-
-# 4. 串口权限
+# 1. 串口权限
 sudo chmod 666 /dev/ttyUSB0
 
-# 5. 确认两个 RealSense 都在
+# 2. 确认两个 RealSense 都在
 python3 -c "import pyrealsense2 as rs; [print(d.get_info(rs.camera_info.serial_number)) for d in rs.context().devices]"
 # 应该看到: 135122071432（狗）和 115222070999（臂）
+或者
+lsusb
 
-# 6. 启动
-nohup python3 -u total10.py > robot_run.log 2>&1 &
+# 3. 启动
+nohup python3 -u total.py > robot_run.log 2>&1 &
 
-# 7. 看日志
+# 4. 看日志
 tail -f robot_run.log
 ```
 

@@ -54,7 +54,7 @@ STATE 7 (RETURN)
 
 ## 现场可调参数
 
-### total10.py（顶部常量）
+### total11.py（顶部常量）
 
 ```python
 DOG_CAMERA_SERIAL = "135122071432"    # 狗用 RealSense
@@ -67,7 +67,7 @@ POINT2_RIGHT_DURATION = 1.5          # 位置②右移时长(秒)
 RET_SUB_PHASE0_LINE_TIME = 4.0       # 位置③巡线时长(秒)
 ```
 
-### arm_one_shot.py（顶部常量）
+### arm.py（顶部常量）
 
 ```python
 # 初始姿态（左右各一套）
@@ -93,7 +93,7 @@ GRIPPER_CLOSE_DEFAULT = 800           # 夹爪闭合值，三棱锥可能要调
 - 无论臂成功/失败/超时，狗都继续，不死等
 - 臂启动时枚举相机 → 序列号不在 → 立即 exit(1)，不卡
 
-## 单独测试机械臂
+## 单独测试机械臂 single_arm.py
 
 ```bash
 # 只夹取（左）

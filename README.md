@@ -5,8 +5,8 @@
 
 | 文件 | 作用 |
 |------|------|
-| `total10.py` | 狗主控，状态机 + 巡线 + 避障 + 三个位置点调机械臂 |
-| `arm_one_shot.py` | 机械臂一次性脚本，支持 grab / place / place_grab 三种任务 |
+| `total11.py` | 狗主控，状态机 + 巡线 + 避障 + 三个位置点调机械臂 |
+| `arm.py` | 机械臂一次性脚本，支持 grab / place / place_grab 三种任务 |
 | `servo.py` | Lobot 舵机串口驱动（来自 arm_code） |
 | `Template_*.png` | 模板匹配图片（电/氧化剂/辐射） |
 
@@ -16,7 +16,7 @@ sudo chmod 666 /dev/ttyUSB0
 
 # 2. 确认两个 RealSense 都在
 python3 -c "import pyrealsense2 as rs; [print(d.get_info(rs.camera_info.serial_number)) for d in rs.context().devices]"
-# 应该看到: 135122071432（狗）和 115222070999（臂）
+应该看到: 135122071432（狗）和 115222070999（臂）
 或者
 lsusb
 

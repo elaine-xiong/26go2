@@ -92,19 +92,7 @@ POSE_PLACE = {
 }
 
 GRIPPER_CLOSE_DEFAULT = 800           # 夹爪闭合值，三棱锥可能要调
-```
 
-### arm_one_shot.py 命令行
-
-```bash
-python3 arm_one_shot.py \
-    --serial 115222070999 \
-    --port /dev/ttyUSB0 \
-    --timeout 15 \
-    --task grab|place|place_grab \
-    --direction left|right \
-    --grip-close 800 \
-    --label point1
 ```
 
 ## 保险措施
@@ -118,11 +106,11 @@ python3 arm_one_shot.py \
 
 ```bash
 # 只夹取（左）
-python3 arm_one_shot.py --serial 115222070999 --task grab --direction left
+python3 single_arm.py --serial 115222070999 --task grab --direction left
 
 # 只放（右）
-python3 arm_one_shot.py --serial 115222070999 --task place --direction right
+python3 single_arm.py --serial 115222070999 --task place --direction right
 
 # 先放再夹（右）
-python3 arm_one_shot.py --serial 115222070999 --task place_grab --direction right
+python3 single_arm.py --serial 115222070999 --task place_grab --direction right
 ```

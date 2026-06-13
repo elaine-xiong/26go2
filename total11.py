@@ -1,6 +1,6 @@
 # -*- coding: gbk -*-
 # 集成版：机械臂联动
-# nohup python -u total10.py > robot_run.log 2>&1 &
+# nohup python -u total.py > robot_run.log 2>&1 &
 import cv2
 import cv2.aruco as aruco
 import numpy as np
@@ -38,17 +38,39 @@ DOG_CAMERA_SERIAL = "135122071432"
 
 # 机械臂脚本路径（与本文件同目录）
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-ARM_SCRIPT_PATH = os.path.join(_THIS_DIR, "arm_one_shot.py")
+ARM_SCRIPT_PATH = os.path.join(_THIS_DIR, "arm.py")
 ARM_CAMERA_SERIAL = "115222070999"
 ARM_PORT = "/dev/ttyUSB0"
-ARM_TIMEOUT = 40.0           # 臂脚本整体超时
+ARM_TIMEOUT = 60.0           # 臂脚本整体超时
 
-# 位置二：横向平移参数
-POINT2_RIGHT_VY = 0.25        # 右移速度
-POINT2_RIGHT_DURATION = 1.5   # 右移时长（秒）
+# 位置一：识别动作参数
+POINT1_FAKE_RIGHT_VY = -0.3       # 右移速度
+POINT1_FAKE_RIGHT_DURATION = 1.5  # 右移时长（秒）
+POINT1_FAKE_LEFT_YAWRATE = 1.0    # 左转速度
+POINT1_FAKE_LEFT90_DURATION = 2.0 # 左转90°时长（秒）
+POINT1_FAKE_RIGHT_YAWRATE = -1.0  # 右转速度
+POINT1_FAKE_RIGHT45_DURATION = 1.5 # 右转45°时长（秒）
+
+# 位置一：机械臂前平移调整参数（类似位置二）
+POINT1_ADJ_LEFT_VY = 0.3          # 左移速度（正值=左）
+POINT1_ADJ_LEFT_DURATION = 1.0    # 左移时长（秒）
+POINT1_ADJ_RIGHT_VY = -0.3        # 右移速度（归位，负值=右）
+POINT1_ADJ_RIGHT_DURATION = 2.0   # 右移时长（秒）
+POINT1_RECOGNIZE_TIMEOUT = 1.0    # 识别超时（秒）
+
+# 位置二：平移参数
+POINT2_FORWARD_VX = 0.0       # 前进速度
+POINT2_FORWARD_DURATION = 1.0  # 前进时长（秒）
+POINT2_RIGHT_VY = -0.3         # 右移速度
+POINT2_RIGHT_DURATION = 1.0    # 右移时长（秒）
+POINT2_SUPPRESS_TIME = 11.0     # 位置一机械臂完成后，抑制朝西触发的时长（秒）
 
 # 位置三：STATE_RETURN 子阶段0 巡线时长
-RET_SUB_PHASE0_LINE_TIME = 4.0
+RET_SUB_PHASE0_LINE_TIME = 7.0
+
+# 夹爪力度（三棱锥=800，其余=700，抽签后只改对应的）
+POSITION1_GRIP_CLOSE = 700   # 位置① 夹取力度
+POSITION2_GRIP_CLOSE = 700   # 位置② 夹取力度
 
 # ==========================================
 # 视觉/感知算法模块
@@ -155,6 +177,9 @@ class RobotFSM:
         self.foam_action_lock_until = 0.0
         self.foam_action_busy = False
 
+        # 避障退出延迟
+        self.line_seen_time = None
+
         # IMU / 航向相关（使用 rt/sportmodestate）
         self.sport_state = None
         self.sport_state_lock = threading.Lock()
@@ -170,12 +195,12 @@ class RobotFSM:
         self.return_phase_start = 0.0
         self.return_target_rel_yaw = None
 
-        self.RETURN_FORWARD_VX = 0.28
-        self.RETURN_FORWARD_TIME = 1.6
+        self.RETURN_FORWARD_VX = 0.3
+        self.RETURN_FORWARD_TIME = 2.5
         self.RETURN_HEADING_TOL = 8.0
-        self.RETURN_TURN_GAIN = 0.018
-        self.RETURN_TURN_MAX = 0.60
-        self.RETURN_TURN_MIN = 0.22
+        self.RETURN_TURN_GAIN = 0.025
+        self.RETURN_TURN_MAX = 0.80
+        self.RETURN_TURN_MIN = 0.40
 
         # STATE_RETURN 子阶段（新增）
         # ret_sub_phase = 0: 计时巡线 → 停住 → 机械臂
@@ -188,8 +213,9 @@ class RobotFSM:
         self.point1_done = False
         self.point2_done = False
         self.point1_object_label = None
-        self.point2_west_entry_count = 0
         self.point2_prev_west = False
+        self.point2_suppress_until = None   # 位置二触发抑制时间锁
+        self.point2_wait_fresh_west = False # 解锁后，等待一次“新的进入西向”边沿
 
         # --- 鱼眼识别配置 ---
         self.K = np.array([[265.0, 0, 320.0], [0, 265.0, 240.0], [0, 0, 1]], dtype=np.float32)
@@ -308,7 +334,7 @@ class RobotFSM:
         if msg:
             print(msg)
         self.safe_move(0, 0, 0, force=True)
-        time.sleep(5.0)
+        time.sleep(3.0)
 
     # ==========================================
     # 机械臂子进程调用（新增）
@@ -316,7 +342,7 @@ class RobotFSM:
     def _call_arm(self, position_label, timeout=None, task="grab",
                   direction="left", grip_close=700):
         """
-        启动 arm_one_shot.py 子进程，等待完成或超时。
+        启动 arm.py 子进程，等待完成或超时。
         返回 True=成功, False=失败/超时/异常
         无论成败，狗继续流程，不死等。
         """
@@ -430,27 +456,60 @@ class RobotFSM:
         """
         第一个IMU点触发后的图像识别 + 机械臂操作。
         """
-        print(">>> 第一个点：开始图像识别，确定物块放置位置 <<<")
-        label = self._recognize_template_label(timeout=10.0)
+        # ===== 快速识别（缩短无用时间）=====
+        print(">>> 第一个点：快速图像识别 <<<")
+        label = self._recognize_template_label(timeout=POINT1_RECOGNIZE_TIMEOUT)
         self.point1_object_label = label
 
         if label is None:
             print("[Point1] 没识别到有效目标")
         else:
             print(f"[Point1] 识别结果 label = {label}")
-            # TODO: 根据 label 做不同处理（如放置不同物块）
-            # if label == 0: ...
-            # elif label == 1: ...
-            # elif label == 2: ...
 
-        # ===== 新增：调用机械臂抓取 =====
+        # ===== 平移调整（类似位置二）=====
+        # 机械臂前先向左稍微平移
+        print(f">>> 第一个点：向左平移 {POINT1_ADJ_LEFT_DURATION}s <<<")
+        self.move_continuous(0, POINT1_ADJ_LEFT_VY, 0, POINT1_ADJ_LEFT_DURATION)
+        self.safe_move(0, 0, 0, force=True)
+        time.sleep(0.3)
+
+        # ===== 调用机械臂抓取 =====
         print(">>> 第一个点：启动机械臂抓取 <<<")
-        success = self._call_arm("point1", task="grab", direction="left")
+        success = self._call_arm("point1", task="grab", direction="left",
+                                grip_close=POSITION1_GRIP_CLOSE)
         if success:
             print("[Point1] 机械臂抓取成功")
         else:
             print("[Point1] 机械臂抓取失败/超时，继续流程")
 
+        # 机械臂完成后向右平移归位
+        print(f">>> 第一个点：向右平移归位 {POINT1_ADJ_RIGHT_DURATION}s <<<")
+        self.move_continuous(0, POINT1_ADJ_RIGHT_VY, 0, POINT1_ADJ_RIGHT_DURATION)
+        self.safe_move(0, 0, 0, force=True)
+        time.sleep(0.3)
+
+        # ===== 伪识别动作 =====
+        # 向右平移
+        self.move_continuous(0, POINT1_FAKE_RIGHT_VY, 0, POINT1_FAKE_RIGHT_DURATION)
+        self.safe_move(0, 0, 0, force=True)
+        time.sleep(0.3)
+        # 向左旋转90°
+        self.move_continuous(0, 0, POINT1_FAKE_LEFT_YAWRATE, POINT1_FAKE_LEFT90_DURATION)
+        self.safe_move(0, 0, 0, force=True)
+        time.sleep(0.3)
+        # 定3秒
+        self.safe_move(0, 0, 0, force=True)
+        time.sleep(3.0)
+        # 向右转45°
+        self.move_continuous(0, 0, POINT1_FAKE_RIGHT_YAWRATE, POINT1_FAKE_RIGHT45_DURATION)
+        self.safe_move(0, 0, 0, force=True)
+        print(">>> 第一个点：识别动作完成 <<<")
+
+        # 位置二触发时间锁：伪识别全部结束后才开始计时
+        self.point2_suppress_until = time.time() + POINT2_SUPPRESS_TIME
+        self.point2_wait_fresh_west = False
+        self.point2_prev_west = self._yaw_near(100.0)  # 记录抑制开始时的当前状态
+        print(f"[Point2] 抑制朝西触发直到 {self.point2_suppress_until:.1f}")
     def init_hardware(self):
         ChannelFactoryInitialize(0, self.iface)
 
@@ -509,8 +568,9 @@ class RobotFSM:
             self.point1_done = False
             self.point2_done = False
             self.point1_object_label = None
-            self.point2_west_entry_count = 0
             self.point2_prev_west = False
+            self.point2_suppress_until = None
+            self.point2_wait_fresh_west = False
         # ===== 新增：STATE_RETURN 子阶段重置 =====
         if new_state == STATE_RETURN:
             self.ret_sub_phase = 0
@@ -546,16 +606,23 @@ class RobotFSM:
         h = frame.shape[0]
         cooldown = (now - self.last_turn_finish_time) < self.TURN_COOLDOWN
 
-        # 第一优先级：检测是否重新看到线
+        # 第一优先级：检测是否重新看到线（保持2秒避障再退出）
         roi = frame[int(h * 0.9):h, :]
         best, _ = detect_track_line(roi)
 
         if (not cooldown) and (best is not None):
-            print("Line reacquired! Exit obstacle avoid.")
-            self.safe_move(0, 0, 0, force=True)
-            time.sleep(0.2)
-            self.set_state(STATE_FOLLOW_TO_STAIR)
-            return False
+            if self.line_seen_time is None:
+                self.line_seen_time = now
+                print("Line reacquired! Hold OA for 2s...")
+            elif now - self.line_seen_time >= 2.0:
+                print("Line reacquired! Exit obstacle avoid.")
+                self.line_seen_time = None
+                self.safe_move(0, 0, 0, force=True)
+                time.sleep(0.2)
+                self.set_state(STATE_FOLLOW_TO_STAIR)
+                return False
+        else:
+            self.line_seen_time = None
 
         # 第二优先级：雷达避障
         front = self.front_dist
@@ -640,7 +707,7 @@ class RobotFSM:
         time.sleep(0.5)
 
         # 爬楼
-        self.move_continuous(0.3, 0, 0, 2.5)
+        self.move_continuous(0.3, 0, 0, 3.0)
         self.move_continuous(0.35, 0, -0.1, 2.0)
         time.sleep(1.0)
 
@@ -833,35 +900,55 @@ class RobotFSM:
                         self.do_line_follow_post_stair(frame)
 
                         west_now = self._yaw_near(100.0)
-                        if west_now and (not self.point2_prev_west):
-                            self.point2_west_entry_count += 1
-                            print(f"[Point2] west entry count = {self.point2_west_entry_count}")
+                        trigger = False
 
-                        self.point2_prev_west = west_now
+                        # 1) 抑制期内：完全不允许触发，也不”记账”
+                        if self.point2_suppress_until is not None and now < self.point2_suppress_until:
+                            self.point2_prev_west = west_now
+                            self.point2_wait_fresh_west = False
+                        else:
+                            # 2) 抑制期刚结束：进入“等待锁外新边沿”模式
+                            if self.point2_suppress_until is not None and now >= self.point2_suppress_until:
+                                print("[Point2] 抑制结束，等待锁外第一次新的西向进入")
+                                self.point2_suppress_until = None
+                                self.point2_wait_fresh_west = True
+                                self.point2_prev_west = west_now   # 关键：从当前状态重新开始判边沿
 
-                        # ==============================================
-                        # 位置二：第二次回到西 → 右移 → 机械臂 → 左移
-                        # ==============================================
-                        if self.imu_ready and (not self.point2_done) and self.point1_done and self.point2_west_entry_count >= 2:
+                            # 3) 只有锁外出现”False -> True”的新边沿，才触发
+                            if self.imu_ready and (not self.point2_done) and self.point1_done and self.point2_wait_fresh_west:
+                                if west_now and (not self.point2_prev_west):
+                                    trigger = True
+
+                            self.point2_prev_west = west_now
+
+                        if trigger:
                             self.point2_done = True
+                            self.point2_suppress_until = None
                             self.safe_move(0, 0, 0, force=True)
                             time.sleep(0.3)
 
-                            # ① 向右平移
+                            # ① 前进
+                            print(f">>> 第二个点：前进 {POINT2_FORWARD_DURATION}s <<<")
+                            self.move_continuous(POINT2_FORWARD_VX, 0, 0, POINT2_FORWARD_DURATION)
+                            self.safe_move(0, 0, 0, force=True)
+                            time.sleep(0.3)
+
+                            # ② 向右平移
                             print(f">>> 第二个点：向右平移 {POINT2_RIGHT_DURATION}s <<<")
                             self.move_continuous(0, POINT2_RIGHT_VY, 0, POINT2_RIGHT_DURATION)
                             self.safe_move(0, 0, 0, force=True)
                             time.sleep(0.3)
 
-                            # ② 机械臂抓取
+                            # ③ 机械臂抓取
                             print(">>> 第二个点：启动机械臂抓取 <<<")
-                            success = self._call_arm("point2", task="place_grab", direction="right")
+                            success = self._call_arm("point2", task="place_grab", direction="right",
+                                                    grip_close=POSITION2_GRIP_CLOSE)
                             if success:
                                 print("[Point2] 机械臂抓取成功")
                             else:
                                 print("[Point2] 机械臂抓取失败/超时，继续流程")
 
-                            # ③ 向左平移归位
+                            # ④ 向左平移归位
                             print(f">>> 第二个点：向左平移归位 {POINT2_RIGHT_DURATION}s <<<")
                             self.move_continuous(0, -POINT2_RIGHT_VY, 0, POINT2_RIGHT_DURATION)
                             self.safe_move(0, 0, 0, force=True)

@@ -97,11 +97,11 @@ GRIPPER_CLOSE_DEFAULT = 800           # 夹爪闭合值，三棱锥可能要调
 
 ```bash
 # 只夹取（左）
-python3 single_arm.py --serial 115222070999 --task grab --direction left
+python single_arm.py --serial 115222070999 --task pos1_grab --direction left
 
 # 只放（右）
-python3 single_arm.py --serial 115222070999 --task place --direction right
+python single_arm.py --serial 115222070999 --task pos2_place --direction right
 
 # 先放再夹（右）
-python3 single_arm.py --serial 115222070999 --task place_grab --direction right
+python single_arm.py --serial 115222070999 --task pos3_place_grab --direction right
 ```
